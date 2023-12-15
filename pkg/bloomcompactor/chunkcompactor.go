@@ -3,13 +3,12 @@ package bloomcompactor
 import (
 	"context"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/common/model"
+	"io"
+	"os"
+	"path/filepath"
 
 	"github.com/grafana/loki/pkg/logproto"
 	v1 "github.com/grafana/loki/pkg/storage/bloom/v1"
@@ -96,7 +95,69 @@ func buildBloomFromSeries(seriesMeta seriesMeta, fpRate float64, tokenizer compa
 	return bloomForChks
 }
 
+func getSizeOfData(data io.ReadSeekCloser) (int64, error) {
+	size := int64(0)
+	var err error
+	if s, ok := data.(io.Seeker); ok {
+		if size, err = s.Seek(0, io.SeekEnd); err == nil {
+			// seek back to the start of file so that it can be served properly
+			if _, err = s.Seek(0, io.SeekStart); err == nil {
+				return size, nil
+			}
+			return -1, err
+		}
+		return -1, err
+	}
+	return -1, fmt.Errorf("data is not a seeker")
+}
+
 // TODO Test this when bloom block size check is implemented
+func buildBlocksFromBlooms(
+	ctx context.Context,
+	logger log.Logger,
+	builder blockBuilder,
+	blooms v1.Iterator[v1.SeriesWithBloom],
+	job Job,
+	client chunkClient,
+	bt compactorTokenizer,
+	fpRate float64) ([]bloomshipper.Block, error) {
+	// Ensure the context has not been canceled (ie. compactor shutdown has been triggered).
+	if err := ctx.Err(); err != nil {
+		return []bloomshipper.Block{}, err
+	}
+
+	block, err := buildBlockFromBlooms(ctx, logger, builder, blooms, job)
+	if err != nil {
+		level.Error(logger).Log("msg", "building bloomBlocks", "err", err)
+		return []bloomshipper.Block{}, err
+	}
+
+	size, err := getSizeOfData(block.Data)
+	if size < int64(500*1024*1024) { // TODO, this should be a constant
+		return []bloomshipper.Block{block}, nil
+	} else { // split it into 2
+		mid := len(job.seriesMetas) / 2
+		job1 := NewJob(job.tenantID, job.tableName, job.indexPath, job.seriesMetas[0:mid])
+		job2 := NewJob(job.tenantID, job.tableName, job.indexPath, job.seriesMetas[:mid])
+
+		bloomIter1 := newLazyBloomBuilder(ctx, job1, client, bt, fpRate)
+		bloomIter2 := newLazyBloomBuilder(ctx, job2, client, bt, fpRate)
+
+		block1, err := buildBlockFromBlooms(ctx, logger, builder, bloomIter1, job)
+		if err != nil {
+			level.Error(logger).Log("msg", "building bloomBlocks 1", "err", err)
+			return []bloomshipper.Block{}, err
+		}
+
+		block2, err := buildBlockFromBlooms(ctx, logger, builder, bloomIter2, job)
+		if err != nil {
+			level.Error(logger).Log("msg", "building bloomBlocks 2", "err", err)
+			return []bloomshipper.Block{}, err
+		}
+		return []bloomshipper.Block{block1, block2}, nil
+	}
+}
+
 func buildBlockFromBlooms(
 	ctx context.Context,
 	logger log.Logger,
@@ -154,22 +215,22 @@ func compactNewChunks(
 	bt compactorTokenizer,
 	storeClient chunkClient,
 	builder blockBuilder,
-) (bloomshipper.Block, error) {
+) ([]bloomshipper.Block, error) {
 	// Ensure the context has not been canceled (ie. compactor shutdown has been triggered).
 	if err := ctx.Err(); err != nil {
-		return bloomshipper.Block{}, err
+		return []bloomshipper.Block{}, err
 	}
 
 	bloomIter := newLazyBloomBuilder(ctx, job, storeClient, bt, fpRate)
 
 	// Build and upload bloomBlock to storage
-	block, err := buildBlockFromBlooms(ctx, logger, builder, bloomIter, job)
+	blocks, err := buildBlocksFromBlooms(ctx, logger, builder, bloomIter, job, storeClient, bt, fpRate)
 	if err != nil {
 		level.Error(logger).Log("msg", "building bloomBlocks", "err", err)
-		return bloomshipper.Block{}, err
+		return []bloomshipper.Block{}, err
 	}
 
-	return block, nil
+	return blocks, nil
 }
 
 type lazyBloomBuilder struct {

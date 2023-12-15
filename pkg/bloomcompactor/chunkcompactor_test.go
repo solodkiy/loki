@@ -109,7 +109,8 @@ func TestChunkCompactor_CompactNewChunks(t *testing.T) {
 	pbb := mockPersistentBlockBuilder{}
 
 	// Run Compaction
-	compactedBlock, err := compactNewChunks(context.Background(), logger, job, fpRate, &mbt, &mcc, &pbb)
+	compactedBlocks, err := compactNewChunks(context.Background(), logger, job, fpRate, &mbt, &mcc, &pbb)
+	compactedBlock := compactedBlocks[0]
 
 	// Validate Compaction Succeeds
 	require.NoError(t, err)

@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/go-kit/log"
@@ -488,14 +489,14 @@ func (c *Compactor) runCompact(ctx context.Context, logger log.Logger, job Job, 
 		}
 
 		fpRate := c.limits.BloomFalsePositiveRate(job.tenantID)
-		storedBlock, err := compactNewChunks(ctx, logger, job, fpRate, bt, storeClient.chunk, builder)
+		storedBlocks, err := compactNewChunks(ctx, logger, job, fpRate, bt, storeClient.chunk, builder)
 		if err != nil {
 			return level.Error(logger).Log("msg", "failed to compact new chunks", "err", err)
 		}
 
 		archivePath := filepath.Join(c.cfg.WorkingDirectory, uuid.New().String())
 
-		blockToUpload, err := c.compressBloomBlock(storedBlock, archivePath, localDst, logger)
+		blocksToUpload, err := c.compressBloomBlock(storedBlocks, archivePath, localDst, logger)
 		if err != nil {
 			level.Error(logger).Log("msg", "putting blocks to storage", "err", err)
 			return err
@@ -509,14 +510,14 @@ func (c *Compactor) runCompact(ctx context.Context, logger log.Logger, job Job, 
 
 		// Do not change the signature of PutBlocks yet.
 		// Once block size is limited potentially, compactNewChunks will return multiple blocks, hence a list is appropriate.
-		storedBlocks, err := c.bloomShipperClient.PutBlocks(ctx, []bloomshipper.Block{blockToUpload})
+		blocksThatWereStored, err := c.bloomShipperClient.PutBlocks(ctx, blocksToUpload)
 		if err != nil {
 			level.Error(logger).Log("msg", "putting blocks to storage", "err", err)
 			return err
 		}
 
 		// all blocks are new and active blocks
-		for _, block := range storedBlocks {
+		for _, block := range blocksThatWereStored {
 			bloomBlocksRefs = append(bloomBlocksRefs, block.BlockRef)
 		}
 	} else {
@@ -558,20 +559,28 @@ func (c *Compactor) runCompact(ctx context.Context, logger log.Logger, job Job, 
 	return nil
 }
 
-func (c *Compactor) compressBloomBlock(storedBlock bloomshipper.Block, archivePath, localDst string, logger log.Logger) (bloomshipper.Block, error) {
-	blockToUpload := bloomshipper.Block{}
-	archiveFile, err := os.Create(archivePath)
-	if err != nil {
-		return blockToUpload, err
+func (c *Compactor) compressBloomBlock(storedBlocks []bloomshipper.Block, archivePath, localDst string, logger log.Logger) ([]bloomshipper.Block, error) {
+	blocksToUpload := make([]bloomshipper.Block, 0, len(storedBlocks))
+
+	for i, block := range storedBlocks {
+		archiveFile, err := os.Create(archivePath + strconv.Itoa(i))
+		if err != nil {
+			return blocksToUpload, err
+		}
+
+		err = v1.TarGz(archiveFile, v1.NewDirectoryBlockReader(localDst))
+		if err != nil {
+			level.Error(logger).Log("msg", "creating bloom block archive file", "err", err)
+			return blocksToUpload, err
+		}
+
+		blockToUpload := bloomshipper.Block{
+			BlockRef: block.BlockRef,
+			Data:     archiveFile,
+		}
+
+		blocksToUpload[i] = blockToUpload
 	}
 
-	err = v1.TarGz(archiveFile, v1.NewDirectoryBlockReader(localDst))
-	if err != nil {
-		level.Error(logger).Log("msg", "creating bloom block archive file", "err", err)
-		return blockToUpload, err
-	}
-
-	blockToUpload.BlockRef = storedBlock.BlockRef
-	blockToUpload.Data = archiveFile
-	return blockToUpload, nil
+	return blocksToUpload, nil
 }
