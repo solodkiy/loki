@@ -85,7 +85,7 @@ type BucketReader interface {
 	// IsObjNotFoundErr returns true if error means that object is not found. Relevant to Get operations.
 	IsObjNotFoundErr(err error) bool
 
-	// IsAccessDeniedErr returns true if acces to object is denied.
+	// IsAccessDeniedErr returns true if access to object is denied.
 	IsAccessDeniedErr(err error) bool
 
 	// Attributes returns information about the specified object.
@@ -433,7 +433,7 @@ func WrapWithMetrics(b Bucket, reg prometheus.Registerer, name string) *metricBu
 
 		opsDuration: promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
 			Name:        "objstore_bucket_operation_duration_seconds",
-			Help:        "Duration of successful operations against the bucket",
+			Help:        "Duration of successful operations against the bucket per operation - iter operations include time spent on each callback.",
 			ConstLabels: prometheus.Labels{"bucket": name},
 			Buckets:     []float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 3, 6, 9, 20, 30, 60, 90, 120},
 		}, []string{"operation"}),
@@ -458,11 +458,12 @@ func WrapWithMetrics(b Bucket, reg prometheus.Registerer, name string) *metricBu
 		bkt.opsDuration.WithLabelValues(op)
 		bkt.opsFetchedBytes.WithLabelValues(op)
 	}
-	// fetched bytes only relevant for get and getrange
+
+	// fetched bytes only relevant for get, getrange and upload
 	for _, op := range []string{
 		OpGet,
 		OpGetRange,
-		// TODO: Add uploads
+		OpUpload,
 	} {
 		bkt.opsTransferredBytes.WithLabelValues(op)
 	}
@@ -503,12 +504,14 @@ func (b *metricBucket) Iter(ctx context.Context, dir string, f func(name string)
 	const op = OpIter
 	b.ops.WithLabelValues(op).Inc()
 
+	start := time.Now()
 	err := b.bkt.Iter(ctx, dir, f, options...)
 	if err != nil {
 		if !b.isOpFailureExpected(err) && ctx.Err() != context.Canceled {
 			b.opsFailures.WithLabelValues(op).Inc()
 		}
 	}
+	b.opsDuration.WithLabelValues(op).Observe(time.Since(start).Seconds())
 	return err
 }
 
@@ -592,15 +595,25 @@ func (b *metricBucket) Upload(ctx context.Context, name string, r io.Reader) err
 	const op = OpUpload
 	b.ops.WithLabelValues(op).Inc()
 
-	start := time.Now()
-	if err := b.bkt.Upload(ctx, name, r); err != nil {
+	trc := newTimingReadCloser(
+		NopCloserWithSize(r),
+		op,
+		b.opsDuration,
+		b.opsFailures,
+		b.isOpFailureExpected,
+		nil,
+		b.opsTransferredBytes,
+	)
+	defer trc.Close()
+	err := b.bkt.Upload(ctx, name, trc)
+	if err != nil {
 		if !b.isOpFailureExpected(err) && ctx.Err() != context.Canceled {
 			b.opsFailures.WithLabelValues(op).Inc()
 		}
 		return err
 	}
 	b.lastSuccessfulUploadTime.SetToCurrentTime()
-	b.opsDuration.WithLabelValues(op).Observe(time.Since(start).Seconds())
+
 	return nil
 }
 
@@ -636,6 +649,10 @@ func (b *metricBucket) Name() string {
 	return b.bkt.Name()
 }
 
+type timingReadSeekCloser struct {
+	timingReadCloser
+}
+
 type timingReadCloser struct {
 	io.ReadCloser
 	objSize    int64
@@ -653,12 +670,13 @@ type timingReadCloser struct {
 	transferredBytes  *prometheus.HistogramVec
 }
 
-func newTimingReadCloser(rc io.ReadCloser, op string, dur *prometheus.HistogramVec, failed *prometheus.CounterVec, isFailureExpected IsOpFailureExpectedFunc, fetchedBytes *prometheus.CounterVec, transferredBytes *prometheus.HistogramVec) *timingReadCloser {
+func newTimingReadCloser(rc io.ReadCloser, op string, dur *prometheus.HistogramVec, failed *prometheus.CounterVec, isFailureExpected IsOpFailureExpectedFunc, fetchedBytes *prometheus.CounterVec, transferredBytes *prometheus.HistogramVec) io.ReadCloser {
 	// Initialize the metrics with 0.
 	dur.WithLabelValues(op)
 	failed.WithLabelValues(op)
 	objSize, objSizeErr := TryToGetSize(rc)
-	return &timingReadCloser{
+
+	trc := timingReadCloser{
 		ReadCloser:        rc,
 		objSize:           objSize,
 		objSizeErr:        objSizeErr,
@@ -671,6 +689,15 @@ func newTimingReadCloser(rc io.ReadCloser, op string, dur *prometheus.HistogramV
 		transferredBytes:  transferredBytes,
 		readBytes:         0,
 	}
+
+	_, ok := rc.(io.Seeker)
+	if ok {
+		return &timingReadSeekCloser{
+			timingReadCloser: trc,
+		}
+	}
+
+	return &trc
 }
 
 func (t *timingReadCloser) ObjectSize() (int64, error) {
@@ -692,7 +719,10 @@ func (rc *timingReadCloser) Close() error {
 
 func (rc *timingReadCloser) Read(b []byte) (n int, err error) {
 	n, err = rc.ReadCloser.Read(b)
-	rc.fetchedBytes.WithLabelValues(rc.op).Add(float64(n))
+	if rc.fetchedBytes != nil {
+		rc.fetchedBytes.WithLabelValues(rc.op).Add(float64(n))
+	}
+
 	rc.readBytes += int64(n)
 	// Report metric just once.
 	if !rc.alreadyGotErr && err != nil && err != io.EOF {
@@ -702,4 +732,8 @@ func (rc *timingReadCloser) Read(b []byte) (n int, err error) {
 		rc.alreadyGotErr = true
 	}
 	return n, err
+}
+
+func (rsc *timingReadSeekCloser) Seek(offset int64, whence int) (int64, error) {
+	return (rsc.ReadCloser).(io.Seeker).Seek(offset, whence)
 }
